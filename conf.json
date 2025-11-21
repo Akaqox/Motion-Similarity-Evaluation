@@ -1,0 +1,62 @@
+  {
+  "process":0,
+  "split":0,
+  "train":1,
+  "inference":1,
+
+
+  "train_hp":{
+    "TRIPLET_MARGIN": 0.3,
+    "EPOCHS": 100,
+    "lr": 1e-3,
+    "NUM_WORKERS":6
+  },
+
+  "ae": {
+    "BATCH_SIZE": 64, 
+    "N_FEATURES" : 66, 
+    "ACTION_DIM" : 128,
+    "STATIC_DIM" : 64,
+    "device":"cuda",
+    "full_ae_path":"models/full_ae",
+    "e_m_path":"models/e_m_encoder"
+  },
+
+  "window": {
+    "size": 32,
+    "stride": 4,
+    "matching": 0
+  },
+
+  "data": {
+    "raw_data_dir": "data/UTD-MHAD/",
+    "raw_sample":"data/UTD-MHAD/a18_s1_t4_color.avi",
+    "dataset_dir": "data/ready_train",
+    "metadata": "data/meta.csv",
+    "train_csv": "data/train.csv",
+    "val_csv": "data/val.csv",
+    "split":0.3,
+    "scale":[0.8, 1.2],
+    "shoulder": [11, 12],
+    "hip":[23, 24],
+    "vp" : [-0.5, -0.333, -0.166, 0, 0.166, 0.33, 0.5]
+  },
+
+  "visualization": {
+    "3d_figure_size": [5, 5],
+    "elev": 45,
+    "azim": 80,
+    "joint_color": "red",
+    "bone_color": "blue",
+    "joint_size": 33,
+    "line_width": 2
+  },
+
+  "motion_similarity": {
+    "enabled": false,
+    "model_type": "metric_learning",
+    "embedding_size": 128,
+    "distance_metric": "cosine",
+    "model_path": "models/motion_similarity_model.pth"
+  }
+}
