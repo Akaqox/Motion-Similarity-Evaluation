@@ -1,4 +1,5 @@
 import torch
+import os
 import numpy as np
 from core.demonstrator import Demonstrator as DS
 import matplotlib.pyplot as plt
@@ -6,12 +7,13 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import normalize
 from data.ws import Window_Slider as WS
 from models.ae import FullAutoencoder
-from scipy.spatial.distance import cosine, euclidean, sqeuclidean
+from scipy.spatial.distance import cosine, euclidean, sqeuclidean, cdist
 from fastdtw import fastdtw
+import matplotlib.collections as mc
 
 class Inference():
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, m_path = None):
         self.ws_cfg = cfg.get("window")
         self.ae_cfg = cfg.get("ae")
         self.cfg = cfg
@@ -20,46 +22,62 @@ class Inference():
         self.stride = self.ws_cfg["stride"]
         self.matching = self.ws_cfg["matching"]
         self.n_features = self.ae_cfg["N_FEATURES"]
-        
-        m_path = f'{self.ae_cfg["e_m_path"]}_{self.matching}_{self.n_features}_{self.n_frames}_{self.stride}.pth'
-        model_path = f'{self.ae_cfg["full_ae_path"]}_{self.matching}_{self.n_features}_{self.n_frames}_{self.stride}.pth'
-        self.device = torch.device(self.ae_cfg["device"])
 
-        print(f"Loading full model from {model_path}...")
-        
-        # Check if the model class is available
-        if 'FullAutoencoder' not in globals():
-            print("FATAL: FullAutoencoder class is not defined.")
-            print("Please ensure 'models.ae' is imported correctly.")
-            exit()
-        
+        self.device = torch.device(self.ae_cfg["device"])
+        print(m_path)
         self.model = FullAutoencoder(
             input_features=self.n_features,
             num_frames=self.n_frames,
-            action_dim=self.ae_cfg["ACTION_DIM"],
-            static_dim=self.ae_cfg["STATIC_DIM"]
+            action_dim=128,
+            static_dim=64,
         )
-        try:
-            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
-        except FileNotFoundError:
-            print(f"FATAL: Model file not found at {model_path}")
-            print("Please run train.py to generate the model file.")
-            exit()
-        except RuntimeError as e:
-            print(f"FATAL: Error loading model state_dict.")
-            print("This usually means your 'conf' does not match the saved model.")
-            print(f"Error details: {e}")
-            exit()
-             
-        self.m_model = torch.load(m_path, map_location=self.device, weights_only=False)
-        self.model.to(self.device)
+
+        if not (m_path is None):
+            model_path = None
+            self.m_model = self._load_model(self.model, m_path)
+        else:
+            m_path = f'{self.ae_cfg["e_m_path"]}_{self.matching}_{self.n_features}_{self.n_frames}_{self.stride}.pth'
+            model_path = f'{self.ae_cfg["full_ae_path"]}_{self.matching}_{self.n_features}_{self.n_frames}_{self.stride}.pth'
+            # self.model = FullAutoencoder(
+            #     input_features=self.n_features,
+            #     num_frames=self.n_frames,
+            # )
+
+            
+            self.model = self._load_model(self.model, model_path)
+            self.m_model = self._load_model(self.model, m_path)
+            print(f"Loading full model from {model_path}...")
         
-        self.m_model.eval()
-        self.model.eval() 
-        print("Model loaded successfully.")
+
+
+
+    def _load_model(self, model, model_path):
+        # 1. Check file existence first to avoid try/catch overhead for missing files
+        try:
+            # Attempt 1: Standard state_dict load (updates existing model)
+            state_dict = torch.load(model_path, map_location=self.device)
+            model.load_state_dict(state_dict)
+        except (RuntimeError, Exception) as e:
+            print(f"Standard load failed ({e}). Attempting JIT fallback...")
+            
+            # Attempt 2: Fallback to JIT load (creates NEW model object)
+            try:
+                model = torch.jit.load(model_path, map_location=self.device)
+                print("Success: Loaded model via JIT.")
+            except Exception as jit_e:
+                raise RuntimeError(f"FATAL: Failed to load as state_dict OR JIT.\nOriginal: {e}\nJIT: {jit_e}")
+
+        # Unified configuration
+        model.to(self.device)
+        model.eval()
+        
+        return model
 
     def _load_windows(self, path):
-        seq = np.load(path)
+        if isinstance(path, str):
+            seq = np.load(path)
+        else:
+            seq = path
         slider = WS(self.ws_cfg["size"], self.ws_cfg["stride"])
         windows = slider.slide(seq)
         w_tensor = torch.tensor(windows)
@@ -83,11 +101,10 @@ class Inference():
 
             action_feat= self.m_model(w)
 
- 
-
         return (
             action_feat.squeeze(0)
         )
+        
     def rc_anchor(self, ds, anchor, title):
 
         ani = ds.run_reconstruction_test(self.model, anchor)
@@ -120,12 +137,11 @@ class Inference():
 
     def demonstrate(self, anchor_path1=None, anchor_path2=None, anchor_path3=None):
         # Load anchors safely
-        anchor1 = self._load_windows(anchor_path1) if isinstance(anchor_path1, str) else None
-        anchor2 = self._load_windows(anchor_path2) if isinstance(anchor_path2, str) else None
-        anchor3 = self._load_windows(anchor_path3) if isinstance(anchor_path3, str) else None
+        anchor1 = self._load_windows(anchor_path1)
+        anchor2 = self._load_windows(anchor_path2)
+        anchor3 = self._load_windows(anchor_path3)
 
         ds = DS(self.cfg)
-
 
         ani1 = self.rc_anchor(ds, anchor1, "Anchor 1")
         ani2 = self.rc_anchor(ds, anchor2, "Anchor 2")
@@ -140,38 +156,139 @@ class Inference():
             ani4 = None
 
         return ani1, ani2, ani3, ani4
-                
-    def cosine_similarity(self, v1, v2):
-        denom = np.linalg.norm(v1) * np.linalg.norm(v2)
-        return np.dot(v1, v2) / denom
 
+    def visualize_dtw_alignment(self, f1, f2, path):
+        """
+        f1, f2: The feature arrays used in DTW (N x D)
+        path: The list of tuples [(i, j), ...] returned by fastdtw
+        """
+        # --- Visual 1: The Connection Plot ---
+        plt.figure(figsize=(12, 4))
 
-    def dtw_similarity(self, seq1, seq2):
+        # We use the norm of the features just to have a 1D signal to plot
+        sig1 = np.linalg.norm(f1, axis=1)
+        # Shift sig2 down so we can see the lines clearly
+        sig2 = np.linalg.norm(f2, axis=1) - (np.max(sig1) * 2)
 
+        plt.plot(sig1, label='Seq 1 (Feature Norm)', color='blue')
+        plt.plot(sig2, label='Seq 2 (Feature Norm)', color='orange')
+
+        # Create lines connecting matched indices
+        lines = []
+        for p in path:
+            # p[0] is index in sig1, p[1] is index in sig2
+            # (x, y) coordinates: (index, signal_value)
+            lines.append([(p[0], sig1[p[0]]), (p[1], sig2[p[1]])])
+
+        lc = mc.LineCollection(lines, colors='grey', linewidths=0.5, alpha=0.5)
+        plt.gca().add_collection(lc)
+
+        plt.title("DTW Alignment: Lines show which Patch matches which")
+        plt.legend()
+        plt.tight_layout()
+        plt.show(block=False)
+
+        # --- Visual 2: The Cost Matrix & Path ---
+        # Calculate the full distance matrix to see the 'landscape'
+        dist_mat = cdist(f1, f2, metric='cosine')
+
+        plt.figure(figsize=(8, 8))
+        plt.imshow(dist_mat, origin='lower', cmap='viridis', aspect='auto')
+        plt.colorbar(label='Cosine Distance')
+
+        # Unzip path for plotting
+        path_i, path_j = zip(*path)
+        plt.plot(path_j, path_i, 'w-', linewidth=2, label='Optimal Path')
+
+        plt.xlabel("Sequence 2 Index")
+        plt.ylabel("Sequence 1 Index")
+        plt.title("Alignment Path over Cost Matrix")
+        plt.legend()
+        plt.show()
+
+        # --- Text Output: First 10 matches ---
+        print("Sample Matches (Seq1_Idx -> Seq2_Idx):")
+        for i, j in path[:10]:
+            print(f"Patch {i} -> Patch {j}")
+
+    def dtw_similarity(self, seq1, seq2, vis=False):
         seq1 = self._load_windows(seq1)
         seq2 = self._load_windows(seq2)
 
-        f1 = self.get_encoder_fe(seq1).detach().clone().cpu().numpy()
-        f2 = self.get_encoder_fe(seq2).detach().clone().cpu().numpy()
+        f1 = self.get_encoder_fe(seq1).detach().cpu().numpy()
+        f2 = self.get_encoder_fe(seq2).detach().cpu().numpy()
 
         f1 = f1.reshape(f1.shape[0], -1)
         f2 = f2.reshape(f2.shape[0], -1)
+        
+        # Center the data
+        f1 = f1 - np.mean(f1, axis=0)
+        f2 = f2 - np.mean(f2, axis=0)
 
-        f1 = (f1 - f1.mean(axis=0)) / (f1.std(axis=0) + 1e-6)
-        f2 = (f2 - f2.mean(axis=0)) / (f2.std(axis=0) + 1e-6)
-        _, path = fastdtw(f1, f2, dist=lambda a, b: np.linalg.norm(a - b))
+        # Basic DTW with Cosine
+        _, path = fastdtw(f1, f2, dist=cosine, radius=1)
+        
+        path = np.array(path)
+        aligned_f1 = f1[path[:, 0]]
+        aligned_f2 = f2[path[:, 1]]
 
-        S = []
+        dots = np.sum(aligned_f1 * aligned_f2, axis=1)
+        norms = np.linalg.norm(aligned_f1, axis=1) * np.linalg.norm(aligned_f2, axis=1)
+        
+        # Raw Similarity Scores
+        S = np.divide(dots, norms, out=np.zeros_like(dots), where=norms!=0)
 
-        for (i, j) in path:
-            s_ij = self.cosine_similarity(f1[i], f2[j])
-            S.append(s_ij)
 
-        S = np.array(S)
-        p = -3.0
+        start_trim_thresh = 0.4
+        
+        # Skoru 0.1'den büyük olan ilk ve son indexi bul
+        valid_indices = np.where(S > start_trim_thresh)[0]
 
-        S_avg = (np.mean(np.clip(S, 1e-6, None) ** p)) ** (1.0 / p)
-        S_avg = np.clip(S_avg, 0.0, 1.0)
-        score = 1.0 / (S_avg + 1.0)
-        similarity_0_3 = 6 * (1 - score)
-        return float(np.round(similarity_0_3, 1)), S_avg, S
+        if len(valid_indices) > 5:  # En az 5 karelik anlamlı hareket varsa kesme yap
+            start_idx = valid_indices[0]
+            end_idx = valid_indices[-1]
+            
+            # Sadece anlamlı aralığı al
+            S_trimmed = S[start_idx : end_idx + 1]
+            
+
+            if len(S_trimmed) < len(S) * 0.2:
+                S_active = S 
+            else:
+                S_active = S_trimmed
+        else:
+
+            S_active = S
+
+        th_h = 0.3
+        th_l = 0.6
+        penalty_severity_high = 25.0 
+        penalty_severity_low = 5.0
+
+        gap_h = th_h - S_active
+        gap_l = th_l - S_active
+
+        conditions = [
+            gap_h > 0,  # S < 0.3
+            gap_l > 0   # S < 0.6
+        ]
+
+        choices = [
+            S_active - (gap_h * penalty_severity_high),
+            S_active - (gap_l * penalty_severity_low)
+        ]
+
+        S_weighted = np.select(conditions, choices, default=S_active)
+        
+        S_avg = np.mean(S_weighted)
+
+        # Clip final result to 0-1
+        final_score = float(np.clip(S_avg, 0.0, 1.0))
+
+        print(f"Original Len: {len(S)}, Active Len: {len(S_active)}")
+        print(f"Final Score: {final_score}")
+        
+        if vis:
+            self.visualize_dtw_alignment(f1, f2, path)
+
+        return final_score, S_avg, S

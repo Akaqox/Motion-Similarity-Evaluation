@@ -25,12 +25,20 @@ class Demonstrator:
 
     def _plot_skeleton(self, ax, skeleton, color, label):
         """Helper function to plot a single 2D skeleton."""
-        # Ensure skeleton is (33, 2)
-        if skeleton.shape != (33, 2):
-            if skeleton.shape == (self.n_features,):
+        # Handle flattening cases first
+        if skeleton.ndim == 1:
+            if skeleton.shape[0] == 66:
                 skeleton = skeleton.reshape(33, 2)
-            else:
-                raise ValueError(f"Expected skeleton shape (33, 2), but got {skeleton.shape}")
+            elif skeleton.shape[0] == 99:
+                skeleton = skeleton.reshape(33, 3)
+        
+        # If 3D (33, 3), project to 2D by taking first 2 cols
+        if skeleton.shape == (33, 3):
+            skeleton = skeleton[:, :2]
+
+        # Final check
+        if skeleton.shape != (33, 2):
+            raise ValueError(f"Expected skeleton shape (33, 2) or (33, 3), but got {skeleton.shape}")
             
         x_coords = skeleton[:, 0]
         y_coords = skeleton[:, 1]
@@ -40,7 +48,6 @@ class Demonstrator:
             if start_idx < 33 and end_idx < 33:
                 x_line = [x_coords[start_idx], x_coords[end_idx]]
                 y_line = [y_coords[start_idx], y_coords[end_idx]]
-                # Only add label once to avoid clutter
                 line_label = label if start_idx == 0 and end_idx == 1 else None
                 ax.plot(x_line, y_line, f'{color}-', alpha=0.7, label=line_label)
         
@@ -50,16 +57,27 @@ class Demonstrator:
     def _animate_comparison(self, fig, ax1, ax2, window_batch1, window_batch2, title1, title2):
         """
         Helper to animate two BATCHES of windows side-by-side.
-        Inputs: window_batch1, window_batch2 (shape [B, N_FRAMES, 66])
+        Inputs: window_batch1, window_batch2 (shape [B, N_FRAMES, F]) where F is 66 or 99
         """
-        
         batch_size = window_batch1.shape[0]
+        n_feats = window_batch1.shape[-1]
+
+        # 1. Unified Projection Logic (66->2D, 99->3D->2D)
+        def project_to_2d(batch):
+            if batch.shape[-1] == 99:
+                # Reshape to (B, Frames, 33, 3) then take x,y only
+                return batch.reshape(batch_size, self.n_frames, 33, 3)[..., :2]
+            elif batch.shape[-1] == 66:
+                # Reshape directly to (B, Frames, 33, 2)
+                return batch.reshape(batch_size, self.n_frames, 33, 2)
+            else:
+                raise ValueError(f"Unexpected feature size: {batch.shape[-1]}")
+
+        # frames1/2 are now guaranteed to be (B, F, 33, 2)
+        frames1 = project_to_2d(window_batch1)
+        frames2 = project_to_2d(window_batch2)
         
-        # Reshape from (B, N_FRAMES, 66) -> (B, N_FRAMES, 33, 2)
-        frames1 = window_batch1.reshape(batch_size, self.n_frames, 33, 2)
-        frames2 = window_batch2.reshape(batch_size, self.n_frames, 33, 2)
-        
-        # Find global axis limits
+        # Find global axis limits based on the projected 2D data
         all_data = np.concatenate((frames1, frames2))
         x_min, x_max = all_data[..., 0].min(), all_data[..., 0].max()
         y_min, y_max = all_data[..., 1].min(), all_data[..., 1].max()
@@ -70,16 +88,14 @@ class Demonstrator:
             ax.set_ylim(y_min - padding, y_max + padding)
             ax.grid(True)
             ax.axis('equal')
-            ax.invert_yaxis() # Common for pose data
+            ax.invert_yaxis() 
 
-        # Total number of frames in the *entire* animation
         total_animation_frames = batch_size * self.n_frames
 
-        def update(i): # i will go from 0 to (B * F) - 1
+        def update(i): 
             ax1.clear()
             ax2.clear()
             
-            # Find which window in the batch and which frame in that window
             batch_idx = i // self.n_frames
             frame_idx = i % self.n_frames
             
@@ -92,7 +108,7 @@ class Demonstrator:
             set_axes_limits(ax2)
 
         ani = FuncAnimation(fig, update, frames=total_animation_frames, interval=100, blit=False, repeat=True)
-        return ani # Return ani to keep it in scope
+        return ani
 
     def run_reconstruction_test(self, model, original_window_batch):
         """

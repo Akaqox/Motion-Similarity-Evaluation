@@ -1,20 +1,53 @@
   {
   "process":0,
+  "pre_process":0,
   "split":0,
+  "pretrain":1,
   "train":1,
-  "inference":1,
+  "inference":0,
+  "webapp":1,
 
+  "app_settings": {
+      "threshold": 0.4,
+      "recording_duration": 14.0,
+      "references": [
+        {
+          "name": "Exercise A",
+          "video_path": "data/custom/a.mp4"
+        },
+        {
+          "name": "Exercise B",
+          "video_path": "data/custom/b.mp4"
+        },
+        {
+          "name": "Exercise C",
+          "video_path": "data/custom/c.mp4"
+        },
+        {
+          "name": "Exercise D",
+          "video_path": "data/custom/d.mp4"
+        }
+      ]
+    },
 
+  "eval":{
+    "m_model":"best_model.pt",
+    "deneme":true,
+    "test":true
+  },
   "train_hp":{
     "TRIPLET_MARGIN": 0.3,
     "EPOCHS": 100,
-    "lr": 1e-3,
-    "NUM_WORKERS":6
+    "fine_tune_lr": 1e-6,
+    "lr": 1e-4,
+    "NUM_WORKERS":6,
+    "es_patience":15,
+    "es_delta":0.01
   },
 
   "ae": {
     "BATCH_SIZE": 64, 
-    "N_FEATURES" : 66, 
+    "N_FEATURES" : 99, 
     "ACTION_DIM" : 128,
     "STATIC_DIM" : 64,
     "device":"cuda",
@@ -25,23 +58,28 @@
   "window": {
     "size": 32,
     "stride": 4,
-    "matching": 0
+    "matching": 1
   },
 
   "data": {
-    "raw_data_dir": "data/UTD-MHAD/",
+    "accepted_ext": [".avi", ".mp4", ".mkv"],
+    "custom_np_dir": "data/keypoints/",
+    "raw_data_dir": "data/data_therapy/",
     "raw_sample":"data/UTD-MHAD/a18_s1_t4_color.avi",
-    "dataset_dir": "data/ready_train",
-    "metadata": "data/meta.csv",
-    "train_csv": "data/train.csv",
-    "val_csv": "data/val.csv",
-    "split":0.3,
+    "dataset_dir": "data/ready_train_therapy/",
+    "flip":true,
+    "split":0.1,
     "scale":[0.8, 1.2],
     "shoulder": [11, 12],
     "hip":[23, 24],
     "vp" : [-0.5, -0.333, -0.166, 0, 0.166, 0.33, 0.5]
   },
 
+  "data_pretrain": {
+    "raw_data_dir": "data/UTD-MHAD/",
+    "dataset_dir": "data/ready_train_utd/"
+
+  },
   "visualization": {
     "3d_figure_size": [5, 5],
     "elev": 45,
@@ -50,13 +88,5 @@
     "bone_color": "blue",
     "joint_size": 33,
     "line_width": 2
-  },
-
-  "motion_similarity": {
-    "enabled": false,
-    "model_type": "metric_learning",
-    "embedding_size": 128,
-    "distance_metric": "cosine",
-    "model_path": "models/motion_similarity_model.pth"
   }
 }

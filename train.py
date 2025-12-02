@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-
+import numpy as np
 from tqdm import tqdm
 
 # --- Import your custom modules ---
@@ -14,7 +14,7 @@ class Trainer: # Using the class name from your new code
     """
     A modular class to handle the entire training and evaluation loop.
     """
-    def __init__(self, config, train_dataset, val_dataset):
+    def __init__(self, config, train_dataset, val_dataset, model = None):
         """
         Initializes the model, optimizer, loss functions, and data loader.
         (Using your new config structure)
@@ -44,6 +44,9 @@ class Trainer: # Using the class name from your new code
             num_workers=self.train_hp["NUM_WORKERS"],
             pin_memory=True
         )
+        self.patience = self.train_hp.get("es_patience", 10)
+        self.min_delta = self.train_hp.get("es_delta", 0.0)
+
         self.val_loader = DataLoader(
             dataset=val_dataset,
             batch_size=self.ae_cfg["BATCH_SIZE"],
@@ -53,19 +56,38 @@ class Trainer: # Using the class name from your new code
         )
         print(f"Train data loaded: {len(train_dataset)} samples.")
         print(f"Val data loaded: {len(val_dataset)} samples.")
-
+        lr = 0
         # 2. Setup Model
-        self.model = FullAutoencoder(
-            input_features=self.ae_cfg["N_FEATURES"],
-            num_frames=window_size,
-            action_dim=self.ae_cfg["ACTION_DIM"],
-            static_dim=self.ae_cfg["STATIC_DIM"]
-        ).to(self.device)
+        self.epoch_size = self.train_hp['EPOCHS']
+        if model is None:
+            self.model = FullAutoencoder(
+                input_features=self.ae_cfg["N_FEATURES"],
+                num_frames=window_size,
+                action_dim=128,
+                static_dim=64,
+            ).to(self.device)
+            lr = self.train_hp["lr"]
 
+        elif isinstance(model, str):
+            self.model = FullAutoencoder(
+                input_features=self.n_features,
+                num_frames=self.n_frames,
+                action_dim=128,
+                static_dim=64,
+            ).to(self.device)
+            self.model.load_state_dict(torch.load(model, map_location=self.device))
+            lr = self.train_hp["fine_tune_lr"]
+            self.epoch_size = (self.train_hp['EPOCHS'] * 2)
+        else:
+            self.model = model
+            lr = self.train_hp["fine_tune_lr"]
+            self.epoch_size = (self.train_hp['EPOCHS'] * 2)
+
+        
         # 3. Setup Optimizer
         self.optimizer = optim.Adam(
             self.model.parameters(), 
-            lr=self.train_hp["lr"]
+            lr=lr
         )
 
         # 4. Setup Loss Functions
@@ -202,74 +224,100 @@ class Trainer: # Using the class name from your new code
         }
 
     def fit(self):
-        """
-        Runs the full training loop for all epochs.
-        (This now includes the validation loop)
-        """
-        print(f"Starting training for {self.train_hp['EPOCHS']} epochs...")
-        
-        for epoch in range(self.train_hp['EPOCHS']):
+            """
+            Runs the training loop with Early Stopping.
+            """
+            print(f"Starting training for {self.epoch_size} epochs...")
             
-            # --- TRAINING LOOP ---
-            self.model.train()
-            train_losses = {"total": 0.0, "rec": 0.0, "triplet": 0.0, "cross": 0.0}
+            # --- EARLY STOPPING STATE ---
+            best_val_loss = np.inf
+            patience_counter = 0
             
-            for batch in tqdm(self.train_loader, desc=f"Epoch {epoch+1} TRAIN", leave=False):
-                losses = self._train_step(batch)
-                # --- Accumulate all losses ---
-                train_losses["total"] += losses["total"]
-                train_losses["rec"] += losses["rec"]
-                train_losses["triplet"] += losses["triplet"]
-                train_losses["cross"] += losses["cross"]
-            
-            # --- Calculate average training losses ---
-            num_train_batches = len(self.train_loader)
-            avg_train_total = train_losses["total"] / num_train_batches
-            avg_train_rec = train_losses["rec"] / num_train_batches
-            avg_train_triplet = train_losses["triplet"] / num_train_batches
-            avg_train_cross = train_losses["cross"] / num_train_batches
+            for epoch in range(self.epoch_size):
+                
+                # 1. Training Phase
+                self.model.train()
+                train_losses = {"total": 0.0, "rec": 0.0, "triplet": 0.0, "cross": 0.0}
+                
+                for batch in tqdm(self.train_loader, desc=f"Epoch {epoch+1} TRAIN", leave=False):
+                    losses = self._train_step(batch)
+                    for k in train_losses: train_losses[k] += losses[k]
+                
+                # Averages
+                n_train = len(self.train_loader)
+                avg_train = {k: v / n_train for k, v in train_losses.items()}
 
+                # 2. Validation Phase
+                self.model.eval()
+                val_losses = {"total": 0.0, "rec": 0.0, "triplet": 0.0, "cross": 0.0}
+                
+                with torch.no_grad():
+                    for batch in tqdm(self.val_loader, desc=f"Epoch {epoch+1} VAL  ", leave=False):
+                        losses = self._val_step(batch)
+                        for k in val_losses: val_losses[k] += losses[k]
+                
+                n_val = len(self.val_loader)
+                avg_val = {k: v / n_val for k, v in val_losses.items()}
 
-            # --- VALIDATION LOOP ---
-            self.model.eval() # Set model to evaluation mode
-            # --- Initialize loss accumulators ---
-            val_losses = {"total": 0.0, "rec": 0.0, "triplet": 0.0, "cross": 0.0}
-            
-            with torch.no_grad(): # Disable gradient calculation
-                for batch in tqdm(self.val_loader, desc=f"Epoch {epoch+1} VAL  ", leave=False):
-                    losses = self._val_step(batch)
-                    # --- Accumulate all losses ---
-                    val_losses["total"] += losses["total"]
-                    val_losses["rec"] += losses["rec"]
-                    val_losses["triplet"] += losses["triplet"]
-                    val_losses["cross"] += losses["cross"]
-            
-            # --- Calculate average validation losses ---
-            num_val_batches = len(self.val_loader)
-            avg_val_total = val_losses["total"] / num_val_batches
-            avg_val_rec = val_losses["rec"] / num_val_batches
-            avg_val_triplet = val_losses["triplet"] / num_val_batches
-            avg_val_cross = val_losses["cross"] / num_val_batches
+                # 3. Print Stats
+                print(f"Epoch [{epoch+1}/{self.epoch_size}]")
+                print(f"  Train: Total:{avg_train['total']:.4f} | Rec:{avg_train['rec']:.4f} | Triplet:{avg_train['triplet']:.4f} | Cross:{avg_train['cross']:.4f}")
+                print(f"  Val:   Total:{avg_val['total']:.4f} | Rec:{avg_val['rec']:.4f} | Triplet:{avg_val['triplet']:.4f} | Cross:{avg_val['cross']:.4f}")
 
+                # 4. --- EARLY STOPPING CHECK ---
+                current_val_loss = avg_val["total"]
+                
+                # Check if loss improved (must decrease by at least min_delta)
+                if current_val_loss < (best_val_loss - self.min_delta):
+                    print(f"  [+] Val Loss improved from {best_val_loss:.4f} to {current_val_loss:.4f}. Saving model...")
+                    best_val_loss = current_val_loss
+                    patience_counter = 0 # Reset counter
+                    self.save_model()    # Save the BEST model
+                else:
+                    patience_counter += 1
+                    print(f"  [!] No improvement. Patience: {patience_counter}/{self.patience}")
+                    
+                    if patience_counter >= self.patience:
+                        print(f"--- Early Stopping Triggered at Epoch {epoch+1} ---")
+                        print(f"Best Validation Loss: {best_val_loss:.4f}")
+                        break
 
-            print(f"Epoch [{epoch+1}/{self.train_hp['EPOCHS']}]")
-            print(f"  Train Loss: {avg_train_total:.4f} | "
-                  f"L_rec: {avg_train_rec:.4f} | "
-                  f"L_triplet: {avg_train_triplet:.4f} | "
-                  f"L_cross: {avg_train_cross:.4f}")
-            print(f"  Val Loss:   {avg_val_total:.4f} | "
-                  f"L_rec: {avg_val_rec:.4f} | "
-                  f"L_triplet: {avg_val_triplet:.4f} | "
-                  f"L_cross: {avg_val_cross:.4f}")
-
-        print("--- Training Finished ---")
-        self.save_model()
+            print("--- Training Finished ---")
+            return self.model
 
     def save_model(self):
-        """Saves the trained Action Encoder (E_m) weights."""
-        torch.save(self.model.state_dict(), self.model_path)
-        print(f"Full Autoencoder saved to {self.model_path}")
-        
-        # You can still save the E_m separately if you want
-        torch.save(self.model.E_m, self.e_m_path)
-        print(f"Action Encoder (E_m) saved to {self.e_m_path}")
+            """
+            Saves the model in two formats:
+            1. Standard .pth (weights only) - useful for resuming training.
+            2. JIT .pt (standalone) - useful for deployment/inference without Python class files.
+            """
+            # --- 1. Save Weights (Standard) ---
+            torch.save(self.model, self.model_path)
+            torch.save(self.model.E_m, self.e_m_path) # Warning: This line still has file dependencies!
+            print(f"Weights saved to {self.model_path}")
+
+            # --- 2. Save JIT (Dependency Free) ---
+            
+            # Switch to eval mode for correct tracing
+            self.model.eval()
+            
+            # Create a dummy input that matches your data shape
+            # Shape: (Batch_Size, Channels/Features, Sequence_Length)
+            dummy_input = torch.randn(1, self.n_frames, self.n_features).to(self.device)
+
+            try:
+                # A. Trace Full Autoencoder
+                traced_full = torch.jit.trace(self.model, dummy_input)
+                jit_full_path = self.model_path.replace(".pth", "_jit.pt")
+                traced_full.save(jit_full_path)
+                print(f"JIT Full Model saved to {jit_full_path}")
+
+                # B. Trace Action Encoder (E_m) only
+                # Assuming E_m takes the same input structure
+                traced_enc = torch.jit.trace(self.model.E_m, dummy_input)
+                jit_enc_path = self.e_m_path.replace(".pth", "_jit.pt")
+                traced_enc.save(jit_enc_path)
+                print(f"JIT Encoder saved to {jit_enc_path}")
+                
+            except Exception as e:
+                print(f"WARNING: JIT Tracing failed. {e}")
