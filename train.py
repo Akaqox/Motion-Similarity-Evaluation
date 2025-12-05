@@ -69,13 +69,8 @@ class Trainer: # Using the class name from your new code
             lr = self.train_hp["lr"]
 
         elif isinstance(model, str):
-            self.model = FullAutoencoder(
-                input_features=self.n_features,
-                num_frames=self.n_frames,
-                action_dim=128,
-                static_dim=64,
-            ).to(self.device)
-            self.model.load_state_dict(torch.load(model, map_location=self.device))
+
+            self.model = torch.load(model, weights_only=False, map_location=self.device)
             lr = self.train_hp["fine_tune_lr"]
             self.epoch_size = (self.train_hp['EPOCHS'] * 2)
         else:
@@ -286,38 +281,37 @@ class Trainer: # Using the class name from your new code
             return self.model
 
     def save_model(self):
-            """
-            Saves the model in two formats:
-            1. Standard .pth (weights only) - useful for resuming training.
-            2. JIT .pt (standalone) - useful for deployment/inference without Python class files.
-            """
-            # --- 1. Save Weights (Standard) ---
-            torch.save(self.model, self.model_path)
-            torch.save(self.model.E_m, self.e_m_path) # Warning: This line still has file dependencies!
-            print(f"Weights saved to {self.model_path}")
+        """
+        Saves the model in two formats:
+        1. Standard .pth (weights only) - useful for resuming training.
+        2. JIT .pt (standalone) - useful for deployment/inference without Python class files.
+        """
+        # --- 1. Save Weights (Standard) ---
+        torch.save(self.model, self.model_path)
+        torch.save(self.model.E_m, self.e_m_path) # Warning: This line still has file dependencies!
+        print(f"Weights saved to {self.model_path}")
 
-            # --- 2. Save JIT (Dependency Free) ---
+        # --- 2. Save JIT (Dependency Free) ---
+        
+        self.model.eval()
+        
+        batch = next(iter(self.train_loader))
+        for key in batch:
+            batch[key] = batch[key].to(self.device)
+        data = batch["anchor"]
+        try:
+            # A. Trace Full Autoencoder
+            traced_full = torch.jit.trace(self.model, data)
+            jit_full_path = self.model_path.replace(".pth", "_jit.pt")
+            traced_full.save(jit_full_path)
+            print(f"JIT Full Model saved to {jit_full_path}")
+
+            # B. Trace Action Encoder (E_m) only
+            # Assuming E_m takes the same input structure
+            traced_enc = torch.jit.trace(self.model.E_m, data.permute(0, 2, 1))
+            jit_enc_path = self.e_m_path.replace(".pth", "_jit.pt")
+            traced_enc.save(jit_enc_path)
+            print(f"JIT Encoder saved to {jit_enc_path}")
             
-            # Switch to eval mode for correct tracing
-            self.model.eval()
-            
-            # Create a dummy input that matches your data shape
-            # Shape: (Batch_Size, Channels/Features, Sequence_Length)
-            dummy_input = torch.randn(1, self.n_frames, self.n_features).to(self.device)
-
-            try:
-                # A. Trace Full Autoencoder
-                traced_full = torch.jit.trace(self.model, dummy_input)
-                jit_full_path = self.model_path.replace(".pth", "_jit.pt")
-                traced_full.save(jit_full_path)
-                print(f"JIT Full Model saved to {jit_full_path}")
-
-                # B. Trace Action Encoder (E_m) only
-                # Assuming E_m takes the same input structure
-                traced_enc = torch.jit.trace(self.model.E_m, dummy_input)
-                jit_enc_path = self.e_m_path.replace(".pth", "_jit.pt")
-                traced_enc.save(jit_enc_path)
-                print(f"JIT Encoder saved to {jit_enc_path}")
-                
-            except Exception as e:
-                print(f"WARNING: JIT Tracing failed. {e}")
+        except Exception as e:
+            print(f"WARNING: JIT Tracing failed. {e}")

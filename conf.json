@@ -2,13 +2,13 @@
   "process":0,
   "pre_process":0,
   "split":0,
-  "pretrain":1,
-  "train":1,
+  "pretrain":0,
+  "train":0,
   "inference":0,
   "webapp":1,
 
   "app_settings": {
-      "threshold": 0.4,
+      "threshold": 0.5,
       "recording_duration": 14.0,
       "references": [
         {
@@ -31,22 +31,23 @@
     },
 
   "eval":{
+    "custom" :1,
     "m_model":"best_model.pt",
-    "deneme":true,
+    "model":"",
     "test":true
   },
   "train_hp":{
     "TRIPLET_MARGIN": 0.3,
-    "EPOCHS": 100,
-    "fine_tune_lr": 1e-6,
-    "lr": 1e-4,
+    "EPOCHS": 200,
+    "fine_tune_lr": 1e-5,
+    "lr": 1e-3,
     "NUM_WORKERS":6,
-    "es_patience":15,
-    "es_delta":0.01
+    "es_patience":25,
+    "es_delta":0.001
   },
 
   "ae": {
-    "BATCH_SIZE": 64, 
+    "BATCH_SIZE": 16, 
     "N_FEATURES" : 99, 
     "ACTION_DIM" : 128,
     "STATIC_DIM" : 64,
@@ -57,7 +58,7 @@
 
   "window": {
     "size": 32,
-    "stride": 4,
+    "stride": 2,
     "matching": 1
   },
 

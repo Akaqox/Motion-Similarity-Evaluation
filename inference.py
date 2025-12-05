@@ -13,7 +13,7 @@ import matplotlib.collections as mc
 
 class Inference():
 
-    def __init__(self, cfg, m_path = None):
+    def __init__(self, cfg, m_path = ""):
         self.ws_cfg = cfg.get("window")
         self.ae_cfg = cfg.get("ae")
         self.cfg = cfg
@@ -25,38 +25,27 @@ class Inference():
 
         self.device = torch.device(self.ae_cfg["device"])
         print(m_path)
-        self.model = FullAutoencoder(
-            input_features=self.n_features,
-            num_frames=self.n_frames,
-            action_dim=128,
-            static_dim=64,
-        )
 
-        if not (m_path is None):
-            model_path = None
-            self.m_model = self._load_model(self.model, m_path)
+        if m_path != "" and cfg.get("eval", "custom"):
+            self.m_model = self._load_model(m_path)
+            model_path = f'{self.ae_cfg["full_ae_path"]}_{self.matching}_{self.n_features}_{self.n_frames}_{self.stride}.pth'
         else:
             m_path = f'{self.ae_cfg["e_m_path"]}_{self.matching}_{self.n_features}_{self.n_frames}_{self.stride}.pth'
             model_path = f'{self.ae_cfg["full_ae_path"]}_{self.matching}_{self.n_features}_{self.n_frames}_{self.stride}.pth'
-            # self.model = FullAutoencoder(
-            #     input_features=self.n_features,
-            #     num_frames=self.n_frames,
-            # )
-
             
-            self.model = self._load_model(self.model, model_path)
-            self.m_model = self._load_model(self.model, m_path)
+            self.model = self._load_model(model_path)
+            self.m_model = self._load_model(m_path)
             print(f"Loading full model from {model_path}...")
         
 
 
 
-    def _load_model(self, model, model_path):
+    def _load_model(self, model_path):
         # 1. Check file existence first to avoid try/catch overhead for missing files
         try:
             # Attempt 1: Standard state_dict load (updates existing model)
-            state_dict = torch.load(model_path, map_location=self.device)
-            model.load_state_dict(state_dict)
+            model = torch.load(model_path, weights_only=False, map_location=self.device)
+
         except (RuntimeError, Exception) as e:
             print(f"Standard load failed ({e}). Attempting JIT fallback...")
             
@@ -80,6 +69,9 @@ class Inference():
             seq = path
         slider = WS(self.ws_cfg["size"], self.ws_cfg["stride"])
         windows = slider.slide(seq)
+        if self.n_features == 66:
+            windows = windows[..., :2] 
+
         w_tensor = torch.tensor(windows)
         return w_tensor
 
@@ -96,11 +88,13 @@ class Inference():
                 w = w.unsqueeze(0).flatten(start_dim=2)  # B=1
             else:
                 w = w.flatten(start_dim=2)
-            w = w.transpose(1, 2)
 
+            print(f"Shape before transpose check: {w.shape}")
+            if w.shape[-1] == self.n_features:
+                w = w.permute(0, 2, 1)
 
             action_feat= self.m_model(w)
-
+            
         return (
             action_feat.squeeze(0)
         )
@@ -239,7 +233,7 @@ class Inference():
         S = np.divide(dots, norms, out=np.zeros_like(dots), where=norms!=0)
 
 
-        start_trim_thresh = 0.4
+        start_trim_thresh = 0.5
         
         # Skoru 0.1'den büyük olan ilk ve son indexi bul
         valid_indices = np.where(S > start_trim_thresh)[0]

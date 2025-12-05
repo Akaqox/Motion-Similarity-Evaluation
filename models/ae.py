@@ -2,193 +2,222 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class ResidualBlock(nn.Module):
+# -----------------------------------------------------------------
+# --- 1. Helper: Spatial Attention (Learns "Connections") ---
+# -----------------------------------------------------------------
+class SpatialGraphAttention(nn.Module):
     """
-    Residual Block with Dilation to increase receptive field.
+    This block looks at the relationships between joints (Spatial)
+    BEFORE looking at time. It simulates finding 'angles' and 'bones'
+    by learning which joints are relevant to each other.
     """
-    def __init__(self, channels, kernel_size=3, dilation=1, dropout=0.2):
+    def __init__(self, in_features, inner_dim=64):
         super().__init__()
-        # Padding for the dilated convolution (conv1)
-        padding1 = (kernel_size - 1) * dilation // 2
+        # We treat the input features (33 joints * 3 coords = 99) 
+        # as the "context" we want to understand.
         
-        # Padding for the standard convolution (conv2, dilation=1)
-        padding2 = (kernel_size - 1) // 2
+        # 1x1 Conv acts as a "Per-Frame" MLP. 
+        # It mixes joints together to find geometric poses.
+        self.query = nn.Conv1d(in_features, inner_dim, kernel_size=1)
+        self.key   = nn.Conv1d(in_features, inner_dim, kernel_size=1)
+        self.value = nn.Conv1d(in_features, in_features, kernel_size=1) # Keep dims same
         
-        self.conv1 = nn.Conv1d(channels, channels, kernel_size, 
-                               stride=1, padding=padding1, dilation=dilation)
-        self.bn1 = nn.BatchNorm1d(channels)
-        
-        self.conv2 = nn.Conv1d(channels, channels, kernel_size, 
-                               stride=1, padding=padding2, dilation=1)
-        self.bn2 = nn.BatchNorm1d(channels)
-        self.dropout = nn.Dropout(dropout)
+        self.amma = nn.Parameter(torch.zeros(1)) # Learnable scalingg
+        self.bn = nn.BatchNorm1d(in_features)
 
     def forward(self, x):
-        residual = x
-        out = F.leaky_relu(self.bn1(self.conv1(x)), 0.2)
-        out = self.dropout(out)
-        out = self.bn2(self.conv2(out))
-        out += residual  # Skip connection
-        return F.leaky_relu(out, 0.2)
-
-class ConvBlock(nn.Module):
-    """Standard Conv Block for downsampling"""
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=2, padding=1):
-        super().__init__()
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding)
-        self.bn = nn.BatchNorm1d(out_channels) # Added BatchNorm for stability
-    
-    def forward(self, x):
-        return F.leaky_relu(self.bn(self.conv(x)), 0.2)
+        # x: [Batch, 99, Time]
+        
+        # Attention across channels (Joints/Coordinates)
+        # We want to know: "Does the Hand correlate with the Elbow?"
+        Q = self.query(x) # [B, 64, T]
+        K = self.key(x)   # [B, 64, T]
+        V = self.value(x) # [B, 99, T]
+        
+        # Calculate correlation between features (Channel Attention)
+        # Note: Usually attention is T x T. Here we want Feature x Feature dominance
+        # But for 1D Motion, a lightweight "Gating" is often more stable:
+        
+        attention = F.softmax(torch.matmul(Q.transpose(1, 2), K) / 8.0, dim=-1) 
+        # We apply this temporal attention to smooth out "glitches" in time
+        # based on spatial consistency.
+        
+        out = torch.matmul(attention, V.transpose(1, 2)).transpose(1, 2)
+        
+        out = self.gamma * out + x # Residual connection
+        return self.bn(out)
 
 # -----------------------------------------------------------------
-# --- 2. IMPROVED Motion Information Encoder (E_M) ---
+# --- 2. Temporal Smoothing Block (Anti-Flicker) ---
 # -----------------------------------------------------------------
-class ActionEncoder(nn.Module):
-    def __init__(self, input_features):
+class SmoothConvBlock(nn.Module):
+    def __init__(self, in_c, out_c, stride=1):
         super().__init__()
-        self.input_features = input_features # Saved for shape checking
-        
-        # 1. Initial Downsampling / Feature expansion
-        self.down1 = ConvBlock(input_features, 64, kernel_size=7, padding=3, stride=2)
-        
-        # 2. Deep Motion Extraction (Residual + Dilation)
-        # Dilation 1, 2, 4 increases receptive field exponentially
-        self.res1 = ResidualBlock(64, dilation=1)
-        self.down2 = ConvBlock(64, 96, stride=2)
-        
-        self.res2 = ResidualBlock(96, dilation=2)
-        self.down3 = ConvBlock(96, 128, stride=2)
-        
-        self.res3 = ResidualBlock(128, dilation=4)
-        
-    def forward(self, x):
-        # --- JIT / SHAPE GUARD ---
-        # If input is (Batch, Frames, Features) [B, 32, 99] but we expect [B, 99, 32]
-        # We auto-permute to fix JIT tracing issues on sub-modules.
-        if x.shape[1] != self.input_features and x.shape[2] == self.input_features:
-            x = x.permute(0, 2, 1)
+        # Reflection Pad mimics natural motion continuity at edges
+        # (Instead of Zero padding which shocks the model)
+        self.pad = nn.ReflectionPad1d(1) 
+        self.conv = nn.Conv1d(in_c, out_c, kernel_size=3, stride=stride, padding=0)
+        self.bn = nn.BatchNorm1d(out_c)
+        self.act = nn.GELU() # GELU is much smoother than ReLU (No sharp 0 cutoff)
 
-        # --- VELOCITY TRICK ---
-        # Explicitly calculate velocity (frame_t - frame_t-1)
-        # This forces the encoder to look at MOTION, not positions.
-        # We pad the first frame to keep shape consistent.
-        velocity = torch.zeros_like(x)
-        velocity[:, :, 1:] = x[:, :, 1:] - x[:, :, :-1]
-        velocity[:, :, 0] = velocity[:, :, 1] # Replicate first frame velocity
+    def forward(self, x):
+        x = self.pad(x)
+        return self.act(self.bn(self.conv(x)))
+
+# -----------------------------------------------------------------
+# --- 3. Geometric Action Encoder ---
+# -----------------------------------------------------------------
+class GeometricActionEncoder(nn.Module):
+    def __init__(self, input_features, latent_dim=128):
+        super().__init__()
         
-        # Use velocity as input instead of raw positions
-        x = velocity
+        # --- Stage 1: Spatial Understanding (The "Angles" Proxy) ---
+        # Before downsampling time, we mix the 99 features to find "Pose"
+        self.spatial_mix = nn.Sequential(
+            nn.Conv1d(input_features, 128, kernel_size=1), # Mix Joints
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+            SpatialGraphAttention(128) # Refine relationships
+        )
         
-        x = self.down1(x) # T/2
-        x = self.res1(x)
+        # --- Stage 2: Temporal Smoothing & Downsampling ---
+        # Now we process the "Pose Sequence"
+        self.t1 = SmoothConvBlock(128, 128, stride=1)       # Smooth
+        self.down1 = SmoothConvBlock(128, 128, stride=2)    # T/2
         
-        x = self.down2(x) # T/4
-        x = self.res2(x)
+        self.t2 = SmoothConvBlock(128, 256, stride=1)       # Smooth
+        self.down2 = SmoothConvBlock(256, 256, stride=2)    # T/4
         
-        x = self.down3(x) # T/8
-        x = self.res3(x)
+        self.t3 = SmoothConvBlock(256, latent_dim, stride=1)
+        self.down3 = SmoothConvBlock(latent_dim, latent_dim, stride=2) # T/8
+
+    def forward(self, x):
+        # x: [Batch, 99, Frames]
+        
+        # 1. Learn Geometry (Frame by Frame)
+        x = self.spatial_mix(x)
+        
+        # 2. Learn Dynamics (Time)
+        x = self.down1(self.t1(x))
+        x = self.down2(self.t2(x))
+        x = self.down3(self.t3(x))
         
         return x
 
 # -----------------------------------------------------------------
-# --- 3. Static Encoder (E_S and E_V) ---
+# --- 4. Robust Static Encoder ---
 # -----------------------------------------------------------------
-class StaticEncoder(nn.Module):
-    def __init__(self, input_features):
+class RobustStaticEncoder(nn.Module):
+    def __init__(self, input_features, output_dim=64):
         super().__init__()
-        self.input_features = input_features # Saved for shape checking
-
-        self.conv1 = ConvBlock(input_features, 32, kernel_size=7, padding=3, stride=2)
-        self.conv2 = ConvBlock(32, 48, stride=2)
-        self.conv3 = ConvBlock(48, 64, stride=2)
-
-    def forward(self, x):
-        # --- JIT / SHAPE GUARD ---
-        if x.shape[1] != self.input_features and x.shape[2] == self.input_features:
-            x = x.permute(0, 2, 1)
-
-        # Static encoder sees raw POSITIONS, not velocity
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        return x
-
-# -----------------------------------------------------------------
-# --- 4. Decoder (D) ---
-# -----------------------------------------------------------------
-class Decoder(nn.Module):
-    def __init__(self, action_channels, static_channels, output_features, num_frames):
-        super().__init__()
-        self.combined_dim = action_channels + static_channels + static_channels 
-
-        self.up1 = nn.Upsample(scale_factor=2, mode='linear', align_corners=False) # Linear is smoother for motion
-        self.conv1 = nn.Conv1d(self.combined_dim, 128, 3, 1, 1)
-        self.bn1 = nn.BatchNorm1d(128)
-
-        self.up2 = nn.Upsample(scale_factor=2, mode='linear', align_corners=False)
-        self.conv2 = nn.Conv1d(128, 64, 3, 1, 1)
-        self.bn2 = nn.BatchNorm1d(64)
-
-        self.up3 = nn.Upsample(scale_factor=2, mode='linear', align_corners=False)
-        self.conv_final = nn.Conv1d(64, output_features, kernel_size=7, stride=1, padding=3)
-
-    def forward(self, action_feat, skeleton_feat, view_feat):
-        # Combine
-        x = torch.cat([action_feat, skeleton_feat, view_feat], dim=1) 
+        # To get the skeleton, we average the FEATURES, not the time output.
+        # We look for features that are constant throughout the clip.
         
-        x = self.up1(x)
-        x = F.leaky_relu(self.bn1(self.conv1(x)), 0.2)
+        self.net = nn.Sequential(
+            nn.Conv1d(input_features, 128, kernel_size=1), # Look at pose
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+            nn.Conv1d(128, 128, kernel_size=3, padding=1), # Look at local change
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+            nn.Conv1d(128, output_dim, kernel_size=1)
+        )
+        
+    def forward(self, x):
+        x = self.net(x) # [B, 64, T]
+        
+        # Global Average Pooling removes ALL motion, leaving only Structure
+        # But we expand it back to [T/8] to match Action Encoder for decoder
+        t_out = x.shape[-1] // 8 # Target temporal dim
+        
+        x = F.adaptive_avg_pool1d(x, 1) # [B, 64, 1]
+        
+        # Return as [B, 64, 1] (Broadcasting handled in decoder)
+        return x 
 
-        x = self.up2(x)
-        x = F.leaky_relu(self.bn2(self.conv2(x)), 0.2)
+# -----------------------------------------------------------------
+# --- 5. Smooth Decoder (Anti-Jitter) ---
+# -----------------------------------------------------------------
+class SmoothDecoder(nn.Module):
+    def __init__(self, action_dim, static_dim, output_features):
+        super().__init__()
+        combined = action_dim + static_dim + static_dim
+        
+        # We use Nearest Neighbor upsampling + Convolution 
+        # This is often smoother than Deconvolution (ConvTranspose) which causes checkerboards
+        self.layer1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='linear', align_corners=False), # Linear smoothing
+            nn.ReflectionPad1d(1),
+            nn.Conv1d(combined, 256, 3),
+            nn.BatchNorm1d(256),
+            nn.GELU()
+        )
+        
+        self.layer2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='linear', align_corners=False),
+            nn.ReflectionPad1d(1),
+            nn.Conv1d(256, 128, 3),
+            nn.BatchNorm1d(128),
+            nn.GELU()
+        )
+        
+        self.final = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='linear', align_corners=False),
+            nn.ReflectionPad1d(3), # Large context for final touch
+            nn.Conv1d(128, output_features, 7) # No activation at end
+        )
 
-        x = self.up3(x)
-        x = self.conv_final(x) # No activation at output (regression)
-
+    def forward(self, action, skeleton, view):
+        # Action: [B, 128, T/8]
+        # Skeleton: [B, 64, 1]
+        
+        T = action.shape[-1]
+        
+        # Expand static features to match time dimension
+        s_exp = skeleton.expand(-1, -1, T)
+        v_exp = view.expand(-1, -1, T)
+        
+        x = torch.cat([action, s_exp, v_exp], dim=1)
+        
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.final(x)
         return x
 
 # -----------------------------------------------------------------
-# --- Main Wrapper ---
+# --- Main Class ---
 # -----------------------------------------------------------------
 class FullAutoencoder(nn.Module):
-    def __init__(self, input_features, num_frames, action_dim=128, static_dim=64):
+    def __init__(self, input_features=99, num_frames=32, action_dim=128, static_dim=64):
         super().__init__()
         
-        if num_frames % 8 != 0:
-            raise ValueError(f"N_FRAMES ({num_frames}) must be divisible by 8.")
-            
-        self.input_features = input_features
+        # 1. Save Config
         self.num_frames = num_frames
+        self.input_features = input_features
+        self.action_dim = action_dim
+        self.static_dim = static_dim
         
-        self.E_m = ActionEncoder(input_features) # Input features -> Velocity internal calculation
-        self.E_s = StaticEncoder(input_features)
-        self.E_v = StaticEncoder(input_features)
+        # 2. Initialize Sub-Modules with the provided dimensions
+        # We pass 'action_dim' as 'latent_dim' to the Motion Encoder
+        self.E_m = GeometricActionEncoder(input_features, latent_dim=action_dim)
         
-        self.D = Decoder(action_dim, static_dim, input_features, num_frames)
-
-    def _format_input(self, window):
-        if window.dim() != 3 or window.shape[1] != self.num_frames:
-             raise ValueError(f"Expected input shape (batch, {self.num_frames}, ...)")
-        return window.permute(0, 2, 1)
-
+        # We pass 'static_dim' as 'output_dim' to the Static Encoders
+        self.E_s = RobustStaticEncoder(input_features, output_dim=static_dim)
+        self.E_v = RobustStaticEncoder(input_features, output_dim=static_dim)
+        
+        # Decoder needs both to know input size
+        self.D = SmoothDecoder(action_dim=action_dim, static_dim=static_dim, output_features=input_features)
     def encode(self, window):
-        window_t = self._format_input(window)
-        
-        # E_m calculates velocity internally now
-        action_feat = self.E_m(window_t)
-        
-        # E_s and E_v see raw positions
-        skeleton_feat = self.E_s(window_t)
-        view_feat = self.E_v(window_t)
-        
-        return action_feat, skeleton_feat, view_feat
+        x = window.permute(0, 2, 1) # [B, F, T]
+        action = self.E_m(x)
+        skeleton = self.E_s(x)
+        view = self.E_v(x)
+        return action, skeleton, view
 
-    def decode(self, action_feat, skeleton_feat, view_feat):
-        reconstructed_window_t = self.D(action_feat, skeleton_feat, view_feat)
-        return reconstructed_window_t.permute(0, 2, 1)
+    def decode(self, action, skeleton, view):
+        recon = self.D(action, skeleton, view)
+        return recon.permute(0, 2, 1) # [B, T, F]
 
     def forward(self, window):
-        action_feat, skeleton_feat, view_feat = self.encode(window)
-        reconstructed_window = self.decode(action_feat, skeleton_feat, view_feat)
-        return reconstructed_window
+        a, s, v = self.encode(window)
+        return self.decode(a, s, v)

@@ -80,12 +80,11 @@ if cfg.get("train"):
 
 if cfg.get("inference"):
 
-    m_d = process_one_file(cfg, "data/recorded_sessions/session_20251201_094111.mp4",)
-    s_d = process_one_file(cfg, "data/custom/a.mp4",)
+    m_d = process_one_file(cfg, "data/ready_train_therapy/a100_s100_t1_v3_f1.npy",)
+    s_d = process_one_file(cfg, "data/ready_train_therapy/a100_s100_t1_v3_f1.npy",)
     v_d = process_one_file(cfg, "data/ready_train_utd/a25_s6_t1_v0_f1.npy", )
 
-    inf = Inference(cfg)
-
+    inf = Inference(cfg, m_path=cfg.get("eval", "m_model"))
     score = inf.dtw_similarity(m_d, s_d, vis=True)
 
     inf.demonstrate(m_d, s_d, v_d)
